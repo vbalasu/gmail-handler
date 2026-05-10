@@ -5,3 +5,5 @@ gmail_token.json
 *-token.json
 venv/
 action-checklist.md
+__pycache__/
+*.pyc
