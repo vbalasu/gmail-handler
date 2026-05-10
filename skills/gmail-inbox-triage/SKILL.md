@@ -1,100 +1,170 @@
 ---
 name: gmail-inbox-triage
-description: Mark unread Gmail inbox emails as read in bulk based on an action checklist file. Use when the user has an action-checklist.md (or similar) listing emails that DO require attention, and wants everything else in the unread inbox marked as read. Triggers: "mark non-checklist emails as read", "clean up inbox based on checklist", "mark as read everything not on my action list", "triage unread inbox".
+description: Analyze unread Gmail inbox, cluster by sender/topic, recommend bulk actions, and mark messages as read after processing. Use when the user says "triage my inbox", "clean up unread", "what's in my inbox", "process my unread email", "help me get to inbox zero", or wants help acting on unread mail without a pre-built checklist.
 ---
 
 # Gmail Inbox Triage
 
-Efficiently mark unread Gmail inbox threads as read in bulk, keeping only the threads referenced in a user-provided action checklist still unread.
+Analyze the unread Gmail inbox, cluster messages, recommend per-cluster actions (bulk mark-read, drill in, reply), and mark messages as read after the user confirms each action. No checklist file required — the skill builds the picture from the inbox itself.
+
+## When invoked with no arguments
+
+Respond immediately with a short explainer (no tool calls, no inbox fetch). Roughly:
+
+> **gmail-inbox-triage** — analyzes your unread Gmail, clusters messages by sender/topic, recommends bulk actions, and marks messages read after you approve. Marks the exact messages you reviewed — new mail that arrives during triage is left untouched.
+>
+> **Usage:** `/gmail-inbox-triage <optional instruction>` — e.g. "triage my inbox", "just clear marketing junk", "help me get to inbox zero", or "what's in my unread?"
+>
+> **Defaults:** account `vbalasu@gmail.com`, window `newer_than:3m`. Override either by saying so.
+
+Then stop. Don't auto-run the workflow until the user gives a directive.
 
 ## Capabilities
 
-- Parse an action checklist (markdown) for senders, subjects, or thread IDs that should stay unread
-- Fetch all unread inbox threads in one paginated call via `gog gmail list`
-- Match unread threads against checklist entries (sender domain, subject keywords, explicit thread IDs)
-- Mark non-checklist threads as read using `gog gmail batch modify` (up to 1000 message IDs per API call)
-- Respect Gmail API rate limits (250 quota units/min/user; batchModify costs 50 each)
+- Fetch unread inbox via `gog gmail list` with sane recency scoping
+- Cluster threads by sender/domain and category, surfacing the largest groups first
+- Recommend per-cluster actions: bulk mark-read for newsletters/transactional/social noise, "needs attention" for action-required messages, "drill in" for ambiguous senders
+- Bulk mark-read via `gog gmail mark-read --query` with verification by re-listing
+- Help draft replies (delegates to `email-reply` skill) and mark replied threads read after sending
 
 ## Prerequisites
 
-- `gog` CLI installed and authenticated for the target Gmail account (check: `gog gmail list --max 1 -a <account>`)
-- An action checklist file (markdown) listing emails that need attention. Default path: `./action-checklist.md`
+- `gog` CLI installed and authenticated for the target Gmail account (`gog gmail list --max 1 -a <account>`)
 
 ## Workflow
 
-### Phase 0: Confirm account
-Before fetching anything, confirm which Gmail account to triage. **Default: `vbalasu@gmail.com`** (the user's personal account; action checklists are typically personal). Briefly state the default and proceed unless the user redirects. Do not assume the Databricks work account.
+### Phase 0: Confirm scope
+Confirm two things in one short message, then proceed:
+1. **Account** — default `vbalasu@gmail.com` (personal). Briefly state the default; do not assume the Databricks work account.
+2. **Recency window** — default `newer_than:3m`. For very full inboxes, suggest narrowing further. Bulk-cleaning years of inbox via the API is the wrong tool; point users to Gmail web UI ("select all → mark read") for that.
 
-### Phase 1: Load checklist
-1. Read the checklist file (default `./action-checklist.md`)
-2. Extract identifying signals from each item:
-   - Sender email/domain (e.g., `junadesaius@gmail.com`, `wellsfargo.com`)
-   - Subject keywords (e.g., "Wells Fargo", "JK Cricket Academy", "VFS Global")
-   - Explicit thread IDs if present
-3. Build a `keep_unread` matcher
-
-### Phase 2: Fetch unread inbox
-Run **one** command — do NOT page manually:
+### Phase 1: Fetch and analyze
 ```bash
-gog gmail list "is:unread in:inbox category:primary" --json --all -a <account> > /tmp/triage_unread.json 2> /tmp/triage_err.log
-```
-Default to `category:primary` since action checklists almost always concern the primary inbox. Drop `category:primary` only if the user explicitly wants all categories OR if the user references the total inbox unread count (sidebar shows e.g. "Inbox 452") that exceeds the primary-only count — that means they want Promotions/Updates/Social cleaned too.
-
-**Sanity-check the count.** After Phase 1 returns N threads, compare against the user's reported unread count. If N << reported, you're scoped too narrowly — re-run without `category:primary`.
-
-**Always redirect stderr to a separate file** (not `2>&1` into the JSON file). gog prints errors like `403 rateLimitExceeded` to stderr; mixing them into the JSON corrupts it.
-
-**Rate limit handling.** gog exits with code 7 on `403 rateLimitExceeded` (Gmail quota: 250 units/min). On exit 7, sleep 70s and retry. Never chain manual sleeps to bypass — use a single retry block. Quota costs: messages.list = 5, batchModify = 50, so a fresh quota window can do ~5 batch-modifies of 1000 IDs each.
-
-### Phase 3: Classify
-Load the JSON, walk each thread, and split into `keep_unread` (matches checklist) vs `mark_read` (doesn't match).
-
-Show the counts to the user before mutating: `"Keep unread: X, Mark read: Y. Proceed?"` — but if the request was unambiguous ("mark non-checklist as read"), skip confirmation.
-
-### Phase 4: Bulk mark as read
-Use **message-level batch modify**, NOT per-thread modify:
-
-```bash
-# 1. Get message IDs (not thread IDs) for the threads to mark read
-gog gmail messages search "is:unread in:inbox category:primary" --json --all -a <account> > /tmp/triage_msgs.json
-
-# 2. Filter out messages whose threadId is in keep_unread
-# 3. Batch modify in chunks of 1000:
-gog gmail batch modify <id1> <id2> ... <id1000> --remove=UNREAD -a <account> -y
+gog gmail list "is:unread in:inbox newer_than:3m" --max 1000 --json -a <account> > /tmp/triage_unread.json 2> /tmp/triage_err.log
 ```
 
-Per-thread `gog gmail thread modify` is ~5x slower and more rate-limit-prone. Always prefer `batch modify` on message IDs.
+**Always redirect stderr separately** — gog prints `403 rateLimitExceeded` and other errors to stderr; merging them into the JSON corrupts it.
 
-### Phase 5: Verify
-```bash
-gog gmail list "is:unread in:inbox category:primary" --json -a <account> | python3 -c "import json,sys;print(len(json.load(sys.stdin).get('threads',[])),'remaining unread')"
+If exit code is 7 (`rateLimitExceeded`, Gmail quota = 250 units/min), sleep 70s and retry once. Don't chain shorter sleeps.
+
+If `nextPageToken` is non-empty after `--max 1000`, the inbox is too big — tell the user the count is `>1000` and recommend narrowing the recency window before continuing.
+
+### Phase 2: Cluster and recommend
+Group threads by:
+- **Sender domain** (e.g., `@notify.wellsfargo.com`, `@linkedin.com`)
+- **Gmail category** (`CATEGORY_UPDATES`, `CATEGORY_PROMOTIONS`, `CATEGORY_SOCIAL`, `CATEGORY_FORUMS`, `CATEGORY_PERSONAL`)
+- **Topic patterns** in subjects (newsletters, receipts, alerts, security, social notifications)
+
+**While clustering, also write the snapshot IDs per cluster** to `/tmp/triage_clusters.json` as `{"<cluster_label>": ["<id>", ...], ...}`. Phase 3 uses these IDs to mark read exactly the messages the user reviewed — this is what prevents new arrivals during triage from being swept up. Example sidecar build:
+
+```python
+import json, collections
+clusters = collections.defaultdict(list)
+for t in threads:
+    label = classify(t)   # e.g. "promotions", "linkedin.com", "paypal.com"
+    clusters[label].append(t['id'])
+json.dump(clusters, open('/tmp/triage_clusters.json','w'))
 ```
-Should equal the `keep_unread` count from Phase 3.
+
+For each cluster of size ≥ 3, classify into a recommendation tier:
+
+| Tier | What it is | Default action |
+|------|-----------|----------------|
+| **Auto-noise** | Marketing, newsletters, social digests, receipts/order confirmations, "your X is ready" — repeating senders with no required action | Recommend bulk mark-read |
+| **Maybe-action** | Bills, security alerts, account warnings, healthcare, tuition, travel, calendar invites | Show subjects; ask user per cluster |
+| **One-off** | Singletons or ambiguous senders | List individually; let user pick |
+
+Present like this — keep it scannable:
+
+```
+Found 87 unread (last 3 months). Recommendations:
+
+AUTO-NOISE — recommend bulk mark-read (62 msgs):
+  • LinkedIn job alerts × 18
+  • Substack newsletters × 14 (Chamath, a16z, Nilesh Jasani)
+  • PayPal/Amazon receipts × 12
+  • Audible promotions × 8
+  • True Classic, United, Delta marketing × 10
+
+MAYBE-ACTION — review (19 msgs):
+  • Wells Fargo balance alerts × 5
+  • Kaiser Permanente care team × 4
+  • AWS Lambda EOL notices × 3
+  • OpenAI/Microsoft action-required × 4
+  • UMN tuition reminders × 3
+
+ONE-OFF (6 msgs):
+  • Sarah Chaplin — Bay Area visit
+  • Tom Linton (Atlan) — meeting request
+  • ...
+
+Reply 'go' to mark all AUTO-NOISE as read, or pick clusters.
+```
+
+### Phase 3: Process per cluster
+For each cluster the user approves, mark read **by message ID** from the snapshot — never by query. Query-based mark-read re-evaluates against the live inbox and will sweep up mail that arrived after the snapshot (see Constraints).
+
+**Bulk mark-read (small cluster, ≤ ~50 IDs)** — pass IDs directly:
+```bash
+gog gmail mark-read <id1> <id2> <id3> ... -y -a <account>
+```
+
+**Bulk mark-read (larger cluster)** — stream IDs through xargs to stay under arg-length limits:
+```bash
+jq -r '.["promotions"][]' /tmp/triage_clusters.json \
+  | xargs -n 50 gog gmail mark-read -y -a <account>
+```
+
+Cluster labels are whatever keys you wrote into `/tmp/triage_clusters.json` in Phase 2 (sender domain, category name, or combined label). To mark several clusters in one go, union the ID lists with jq:
+```bash
+jq -r '(.["promotions"] + .["social"] + .["linkedin.com"])[]' /tmp/triage_clusters.json \
+  | xargs -n 50 gog gmail mark-read -y -a <account>
+```
+
+**Reply needed** — delegate drafting to the `email-reply` skill, then mark-read the specific thread ID (from the snapshot) after the user sends.
+
+**Drill in** — fetch headers/snippet for a single thread:
+```bash
+gog gmail get <messageId> --format=metadata --headers=Subject,From,Date,To --json -a <account>
+```
+
+**Snapshot staleness:** if more than ~10 minutes pass between the Phase 1 fetch and user approval — especially before a broad "mark all" action — re-run Phase 1 to refresh the snapshot before mark-read. The IDs themselves don't go stale, but new mail won't be in the user's review.
+
+### Phase 4: Verify after each batch
+After every mark-read call, **always** re-count rather than trusting the "Marked as read N" line (gog reports `--max` even on no-op queries):
+```bash
+gog gmail list "is:unread in:inbox newer_than:3m" --max 1 --json -a <account> 2>/dev/null | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print('remaining unread:', len(d.get('threads',[])), 'more:', bool(d.get('nextPageToken')))"
+```
+Since mark-read is now ID-based, the count should drop by **exactly** `len(cluster_ids)`. If it didn't, diagnose before retrying — usually either the wrong cluster key was passed to jq, or another client (Gmail web/mobile) read messages concurrently.
+
+### Phase 5: Wrap up
+Summarize: total marked read, total remaining unread, what's left needing attention. Offer to draft replies for the "one-off" cluster.
 
 ## Resources
 
-- `scripts/triage.py`: End-to-end script that runs all phases. Pass `--account <email>` and `--checklist <path>`.
-- `references/gog-cheatsheet.md`: Quick reference for the gog Gmail commands used.
+- `references/gog-cheatsheet.md`: Quick reference for the `gog` Gmail commands used.
+- `scripts/triage.py`: Legacy end-to-end script (checklist-driven, kept for backwards-compat). The current workflow above is interactive and does not use this script.
 
 ## Important Constraints
 
-- **Scope correctly**: Use `in:inbox`, NEVER `-category:primary` alone (the latter matches all unread anywhere in the mailbox including archived mail — this is what caused a 41K-message runaway in the original session). Always anchor to `in:inbox`.
-- **Don't use `-category:primary` to mean "non-primary tabs"** — Gmail's negated-category syntax silently returns zero results when combined with other filters. Use the positive form `(category:updates OR category:promotions OR category:social OR category:forums)` instead. Symptom of the bug: gog reports "Marked as read 500 messages" repeatedly but the inbox count never drops — gog is reporting `--max`, not actual changes, and the underlying query matched nothing.
-- **Scope by recency**: For large backlogs, add `newer_than:3m` (or similar) to bound the work. Bulk-cleaning years of inbox via the API is the wrong tool — point users to Gmail web UI's "select all → mark read" for that.
-- **Verify with a count, not a "marked N" line**: Always sanity-check by re-listing `is:unread in:inbox` after the run. Gmail/gog can report success on a no-op query.
-- **Batch, don't loop**: One `batch modify` call with 1000 IDs replaces 1000 individual `thread modify` calls.
-- **Pace if needed**: If hitting `403 rateLimitExceeded`, sleep 60s before retry. With proper batching this rarely triggers.
+- **Mark-read must be ID-based, not query-based.** `gog gmail mark-read --query '...'` re-evaluates the query against the live inbox at execution time, so any message that arrived after the Phase 1 snapshot and matches the query gets marked read without the user seeing it. Always pass positional message IDs from `/tmp/triage_clusters.json` instead. Use `--query` only for *listing* (Phase 1) and *verification* (Phase 4), never for mutation.
+- **Scope correctly when listing**: always anchor with `in:inbox` and a recency filter (`newer_than:3m`). Without `in:inbox`, queries match archived mail too — this previously caused a 41K-message runaway.
+- **Never use `-category:primary`** in any list/verify query. Gmail silently returns zero results when this is combined with other filters. Use positive forms: `category:updates`, `category:promotions`, or `(category:updates OR category:promotions OR category:social OR category:forums)`.
+- **Verify with a re-list, not the "Marked as read N" output.** `gog gmail mark-read` echoes the count it attempted, not necessarily what changed. Trust counts only after re-running `gog gmail list "is:unread in:inbox …"`.
+- **Don't loop blindly.** If the remaining-unread count doesn't drop after a mark-read, stop and diagnose. A loop on a no-op query wastes time and quota.
+- **Rate limits**: gog exits with code 7 on Gmail's `403 rateLimitExceeded` (250 units/min). Sleep 70s and retry once; don't chain shorter sleeps. With per-sender bulk queries this rarely triggers.
+- **stderr separately**: redirect to a separate file, not `2>&1` into the JSON file.
 
 ## Examples
 
-### Example: Cleanup using default checklist
-User says: "Mark non-checklist primary unread as read"
-Result: Reads `./action-checklist.md`, fetches unread primary inbox, classifies, batch-marks non-matches as read in one or two API calls.
+### Example: Open-ended triage
+User says: "Triage my inbox" or "Help me clean up unread email"
+Result: Confirm account + window → fetch → cluster → present tiered recommendations → process clusters interactively.
 
-### Example: Different account / checklist
-User says: "Use my-cleanup.md to triage work@example.com inbox"
-Result: Loads `my-cleanup.md`, runs against `work@example.com`.
+### Example: Inbox-zero push
+User says: "I want to get to inbox zero"
+Result: Same workflow, but the wrap-up offers to draft replies for everything in the "maybe-action" and "one-off" tiers.
 
-### Example: Inspection only (dry-run)
-User says: "Show what would get marked read but don't do it"
-Result: Run Phases 1-3, print the would-mark-read list, stop before Phase 4.
+### Example: Just mark obvious noise
+User says: "Just clear the marketing junk"
+Result: Skip clustering for "maybe-action" tier; bulk-mark `category:promotions` plus known marketing senders, leave the rest untouched.
