@@ -1,3 +1,7 @@
 client_secret.json
+*client_secret*.json
+*-client-secret.json
 gmail_token.json
+*-token.json
 venv/
+action-checklist.md
