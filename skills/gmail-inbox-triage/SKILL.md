@@ -7,7 +7,13 @@ description: Analyze unread Gmail inbox, cluster by sender/topic, recommend bulk
 
 Analyze the unread **Primary** Gmail inbox, cluster messages, recommend per-cluster actions (bulk mark-read, drill in, reply), and mark messages as read after the user confirms each action. No checklist file required — the skill builds the picture from the inbox itself.
 
-**Scope is always `is:unread in:inbox category:primary`** — only the Primary tab, never Promotions/Social/Updates/Forums. This is deliberate: Primary is where the mail that actually needs a human lives, and scoping to it keeps counts small and matchable against Gmail's UI.
+**Scope is always the Primary tab, written as `{is:unread} category:primary in:inbox`** — never Promotions/Social/Updates/Forums. The `{is:unread}` braces are **load-bearing, not a typo** — see the gog bug note below. This is deliberate: Primary is where the mail that actually needs a human lives, and this query matches Gmail's UI Primary count exactly.
+
+### ⚠️ The gog `category:primary` bug (why the braces)
+
+`gog` does not pass `category:primary` to Gmail as a pure search query. In `internal/cmd/gmail_search_request.go` it *also* extracts a `labelIds=CATEGORY_PERSONAL` filter from the query and ANDs it with the `q` (`gmail_search_labels.go` maps `category:primary → CATEGORY_PERSONAL`). But Gmail's Primary **tab** includes mail the API still labels `CATEGORY_UPDATES` (e.g. Wells Fargo, PayPal, Vanguard — senders trained into Primary). The `labelIds=CATEGORY_PERSONAL` filter drops all of those, so a plain `gog gmail list "is:unread category:primary in:inbox"` returns ~22 instead of the UI's ~276.
+
+**Workaround:** the label extractor bails out (returns no `labelIds`) if any query token contains `{`/`}` or equals `or` (`gmailQuerySystemLabelIDs`, lines 22–24). Wrapping a token in braces — `{is:unread}`, which Gmail parses identically to `is:unread` — forces gog into **pure-`q` mode**, so it queries exactly like the web UI. Verified: plain query → 24 threads; `{is:unread}` query → 282 threads, matching the UI badge. **Always keep a `{}` token in any list/verify query**, or the count silently collapses to the `CATEGORY_PERSONAL` subset.
 
 **Always count threads, not individual messages.** Gmail's UI (the number next to "Inbox"/Primary) counts unread *conversations*. `gog gmail list` returns one entry per thread, so `len(threads)` is the number to report — and it should match what the user sees in Gmail. Never report a message count; if you mention a thread with multiple messages, still count it as one.
 
@@ -19,13 +25,13 @@ Respond immediately with a short explainer (no tool calls, no inbox fetch). Roug
 >
 > **Usage:** `/gmail-inbox-triage <optional instruction>` — e.g. "triage my inbox", "just clear marketing junk", "help me get to inbox zero", or "what's in my unread?"
 >
-> **Defaults:** account `vbalasu@gmail.com`, scope `is:unread in:inbox category:primary` (no recency filter, so the count matches Gmail's UI). Override the account by saying so; add a `newer_than:` window only if you want to narrow further.
+> **Defaults:** account `vbalasu@gmail.com`, scope `{is:unread} category:primary in:inbox` (Primary tab, no recency filter — count matches Gmail's UI badge). Override the account by saying so; add a `newer_than:` window only if you want to narrow further.
 
 Then stop. Don't auto-run the workflow until the user gives a directive.
 
 ## Capabilities
 
-- Fetch unread Primary inbox via `gog gmail list "is:unread in:inbox category:primary"`
+- Fetch unread Primary inbox via `gog gmail list "{is:unread} category:primary in:inbox"` (braces required — see gog bug note)
 - Cluster threads by sender/domain and topic, surfacing the largest groups first
 - Recommend per-cluster actions: bulk mark-read for newsletters/transactional/social noise that slipped into Primary, "needs attention" for action-required threads, "drill in" for ambiguous senders
 - Bulk mark-read by thread/message ID with verification by re-listing (thread counts)
@@ -40,11 +46,11 @@ Then stop. Don't auto-run the workflow until the user gives a directive.
 ### Phase 0: Confirm scope
 State the scope in one short line, then proceed:
 1. **Account** — default `vbalasu@gmail.com` (personal). Briefly state the default; do not assume the Databricks work account.
-2. **Scope** — always `is:unread in:inbox category:primary` (Primary tab only, no recency filter so the thread count matches Gmail's UI). Only add a `newer_than:` window if the user asks to narrow, or if Phase 1 paginates (see below).
+2. **Scope** — always `{is:unread} category:primary in:inbox` (Primary tab, braces required, no recency filter so the thread count matches Gmail's UI). Only add a `newer_than:` window if the user asks to narrow, or if Phase 1 paginates (see below).
 
 ### Phase 1: Fetch and analyze
 ```bash
-gog gmail list "is:unread in:inbox category:primary" --max 1000 --json -a <account> > /tmp/triage_unread.json 2> /tmp/triage_err.log
+gog gmail list "{is:unread} category:primary in:inbox" --max 1000 --json -a <account> > /tmp/triage_unread.json 2> /tmp/triage_err.log
 ```
 
 **Always redirect stderr separately** — gog prints `403 rateLimitExceeded` and other errors to stderr; merging them into the JSON corrupts it.
@@ -137,7 +143,7 @@ gog gmail get <messageId> --format=metadata --headers=Subject,From,Date,To --jso
 ### Phase 4: Verify after each batch
 After every mark-read call, **always** re-count rather than trusting the "Marked as read N" line (gog reports `--max` even on no-op queries). Count **threads**, and pull the full list so the number matches Gmail's UI:
 ```bash
-gog gmail list "is:unread in:inbox category:primary" --max 1000 --json -a <account> 2>/dev/null | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print('remaining unread threads:', len(d.get('threads',[])), 'more:', bool(d.get('nextPageToken')))"
+gog gmail list "{is:unread} category:primary in:inbox" --max 1000 --json -a <account> 2>/dev/null | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print('remaining unread threads:', len(d.get('threads',[])), 'more:', bool(d.get('nextPageToken')))"
 ```
 The thread count should drop by `len(cluster_ids)` — **but multi-message threads are an exception.** `gog gmail mark-read <id>` marks only that one message; a thread with other unread messages stays unread (and stays in the count). When a cluster's count doesn't drop fully, check the snapshot's `messageCount` for the leftover IDs — threads with `messageCount > 1` are the usual reason. Either leave them (often they're real conversations worth seeing) or mark every message in the thread. If the leftovers are *not* multi-message threads, diagnose before retrying — usually the wrong cluster key was passed to jq, or another client (Gmail web/mobile) read mail concurrently.
 
@@ -152,10 +158,10 @@ Summarize: total marked read, total remaining unread, what's left needing attent
 ## Important Constraints
 
 - **Mark-read must be ID-based, not query-based.** `gog gmail mark-read --query '...'` re-evaluates the query against the live inbox at execution time, so any message that arrived after the Phase 1 snapshot and matches the query gets marked read without the user seeing it. Always pass positional message IDs from `/tmp/triage_clusters.json` instead. Use `--query` only for *listing* (Phase 1) and *verification* (Phase 4), never for mutation.
-- **Scope is always `is:unread in:inbox category:primary`** — Primary tab only, every list and verify query. Keep `in:inbox`: Primary category labels persist on messages even after they're archived, so `category:primary` alone can match archived mail and cause a runaway. With `in:inbox` the thread count matches Gmail's Primary unread badge exactly. Don't default to a recency filter (it would undercount vs. the UI); add `newer_than:` only when the user asks to narrow or Phase 1 paginates.
-- **Count threads, not messages.** Gmail's UI counts unread conversations. `gog gmail list` returns one entry per thread, so `len(threads)` is the number to report — never sum messages. A thread with several unread messages still counts as one.
-- **Never use `-category:primary`** in any query. Gmail silently returns zero results when this *negated* form is combined with other filters. The positive `category:primary` used here is safe and is the intended scope.
-- **Verify with a re-list, not the "Marked as read N" output.** `gog gmail mark-read` echoes the count it attempted, not necessarily what changed. Trust counts only after re-running `gog gmail list "is:unread in:inbox category:primary"`.
+- **Scope is always `{is:unread} category:primary in:inbox`** — Primary tab, every list and verify query. The `{}` braces are mandatory: without them gog adds a `labelIds=CATEGORY_PERSONAL` filter that drops the trained-into-Primary mail (Wells Fargo, PayPal, etc.) and collapses the count from ~276 to ~22 (full detail in "The gog `category:primary` bug" section up top). Keep `in:inbox` so archived mail can't leak in. Don't default to a recency filter (it would undercount vs. the UI); add `newer_than:` only when the user asks to narrow or Phase 1 paginates.
+- **Count threads, not messages.** Gmail's UI counts unread conversations. `gog gmail list` returns one entry per thread, so `len(threads)` is the number to report — never sum messages. A thread with several unread messages still counts as one. With the brace query this matches the Gmail Inbox/Primary badge (verified: gog 282 ≈ UI 276 + live arrivals).
+- **Never use `-category:primary`** in any query. Gmail silently returns zero results when this *negated* form is combined with other filters. Use the positive `category:primary` (inside the brace query) instead.
+- **Verify with a re-list, not the "Marked as read N" output.** `gog gmail mark-read` echoes the count it attempted, not necessarily what changed. Trust counts only after re-running `gog gmail list "{is:unread} category:primary in:inbox"`.
 - **Don't loop blindly.** If the remaining-unread count doesn't drop after a mark-read, stop and diagnose. A loop on a no-op query wastes time and quota.
 - **Rate limits**: gog exits with code 7 on Gmail's `403 rateLimitExceeded` (250 units/min). Sleep 70s and retry once; don't chain shorter sleeps. With per-sender bulk queries this rarely triggers.
 - **stderr separately**: redirect to a separate file, not `2>&1` into the JSON file.
@@ -164,7 +170,7 @@ Summarize: total marked read, total remaining unread, what's left needing attent
 
 ### Example: Open-ended triage
 User says: "Triage my inbox" or "Help me clean up unread email"
-Result: State account + scope (`is:unread in:inbox category:primary`) → fetch → report the thread count (matches Gmail's Primary badge) → cluster → present tiered recommendations → process clusters interactively.
+Result: State account + scope (`{is:unread} category:primary in:inbox`) → fetch → report the thread count (matches Gmail's Primary badge) → cluster → present tiered recommendations → process clusters interactively.
 
 ### Example: Inbox-zero push
 User says: "I want to get to inbox zero"
